@@ -1,5 +1,6 @@
 import openmc
 import numpy as np
+from scipy.spatial import cKDTree
 import matplotlib.pyplot as plt
 
 import warnings
@@ -127,39 +128,69 @@ triso_vol   = (4/3)*np.pi*spheres[-1].r**3
 n_triso_particle  = math.ceil(pf_triso*compact_vol / triso_vol)
 n_poison_particle = math.ceil(pf_poison*compact_vol / poison_vol)
 
+def pack_poison_particles(n_required, fuel_centers, triso_r, poison_r, 
+                          cyl_r, z_min, z_max, method='kdtree', max_attempts=1000000):
+    """
+    Finds gaps for poison particles.
+    """
+    poison_centers = []
+    attempts = 0
+    
+    safe_dist_fuel = poison_r + triso_r
+    safe_dist_poison = 2 * poison_r
+    
+    # kdtree method
+    tree = None
+    if method == 'kdtree':
+        tree = cKDTree(fuel_centers)
+    
+    def get_candidate():
+        r = cyl_r * np.sqrt(random.random())
+        theta = 2 * np.pi * random.random()
+        return np.array([r * np.cos(theta), r * np.sin(theta), 
+                         random.uniform(z_min + poison_r, z_max - poison_r)])
+
+    while len(poison_centers) < n_required and attempts < max_attempts:
+        candidate = get_candidate()
+        is_safe = False
+
+        if method == 'kdtree':
+            nearby_fuel = tree.query_ball_point(candidate, safe_dist_fuel)
+            if not nearby_fuel:
+                is_safe = True
+        else:
+            dist_sq = np.sum((fuel_centers - candidate)**2, axis=1)
+            if not np.any(dist_sq < safe_dist_fuel**2):
+                is_safe = True
+
+        # If safe, check against existing poison particles
+        if is_safe:
+            if not poison_centers:
+                poison_centers.append(candidate)
+            else:
+                p_dist_sq = np.sum((np.array(poison_centers) - candidate)**2, axis=1)
+                if not np.any(p_dist_sq < safe_dist_poison**2):
+                    poison_centers.append(candidate)
+        
+        attempts += 1
+
+    if len(poison_centers) < n_required:
+        print(f"Warning: Only placed {len(poison_centers)}/{n_required} particles.")
+    
+    return np.array(poison_centers)
+
 fuel_centers = openmc.model.pack_spheres(radius=spheres[-1].r, region=r_triso, num_spheres=n_triso_particle, seed=12345678)
 
-poison_centers = []
-
-min_dist_sq = (erb_sphere.r + spheres[-1].r)**2
-poison_dist_sq = (2 * erb_sphere.r)**2
-
-def get_random_cylindrical(r_max, z_min, z_max):
-    r = r_max * np.sqrt(random.random())
-    theta = 2 * np.pi * random.random()
-    return np.array([r * np.cos(theta), r * np.sin(theta), random.uniform(z_min, z_max)])
-
-attempts = 0
-max_attempts = 1000000
-
-while len(poison_centers) < n_poison_particle and attempts < max_attempts:
-    candidate = get_random_cylindrical(fuel_cyl_r, reactor_bottom + erb_sphere.r, reactor_top - erb_sphere.r)
-    
-    # fuel particles
-    distances_fuel_sq = np.sum((fuel_centers - candidate)**2, axis=1)
-    if np.any(distances_fuel_sq < min_dist_sq):
-        attempts += 1
-        continue
-        
-    # placed poison particles
-    if poison_centers:
-        distances_poison_sq = np.sum((np.array(poison_centers) - candidate)**2, axis=1)
-        if np.any(distances_poison_sq < poison_dist_sq):
-            attempts += 1
-            continue
-            
-    poison_centers.append(candidate)
-    attempts += 1
+poison_centers = pack_poison_particles(
+    n_required = n_poison_particle,
+    fuel_centers = fuel_centers,
+    triso_r = spheres[-1].r,
+    poison_r = erb_sphere.r,
+    cyl_r = fuel_cyl_r,
+    z_min = reactor_bottom,
+    z_max = reactor_top,
+    method = 'kdtree'
+)
 
 # Create list of TRISO objects
 trisos = []
